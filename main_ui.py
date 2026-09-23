@@ -1,6 +1,7 @@
 # coding:utf-8
 import _thread
 import os
+import time
 import tkinter as tk
 import tkinter.font as tkFont
 from tkinter import messagebox, ttk
@@ -69,7 +70,7 @@ def tkimg_resized(img, w_box, h_box, keep_ratio=True):
         width = w_box
         height = h_box
 
-    img1 = img.resize((width, height), Image.ANTIALIAS)
+    img1 = img.resize((width, height), Image.LANCZOS)
     tkimg = ImageTk.PhotoImage(img1)
     return tkimg
 
@@ -100,6 +101,17 @@ def check_value_valid(mode, save_dir=None, url_path=None, keyword=None, page=Non
     if mode == 1:
         if not (save_dir and url_path):
             error_inform("请检查 论文保存文件夹 URL文件路径 是否已输入")
+            return False
+        if os.path.isfile(save_dir):
+            error_inform("「论文保存文件夹」填的是一个文件，请填写文件夹路径。")
+            return False
+        if os.path.isdir(url_path):
+            error_inform("「URL文件路径」要填写到具体文件，不能只填文件夹。\n\n"
+                         "正确示例：\n"
+                         "C:\\...\\IEEE Xplore Citation BibTeX Download 2026.9.23.8.6.0.bib")
+            return False
+        if not os.path.isfile(url_path):
+            error_inform("找不到文件：\n{}\n\n请确认「URL文件路径」是否正确。".format(url_path))
             return False
     elif mode == 2:
         if not (save_dir and keyword and page):
@@ -150,6 +162,7 @@ class App:
         center_window(self.root)
         # self.root.resizable(False, False)          # 设置窗体不可改变大小
         self.no_title = False
+        self.downloading = False  # 下载任务运行中标记, 防止重复点击造成多线程抢跑
         self.show_title()
         self.body()
 
@@ -255,9 +268,18 @@ class App:
             import os
             if not os.path.exists(save_dir):
                 os.mkdir(save_dir)
-            status, paper_info = organize_info_by_txt(save_dir, url_txt_path, paper_name_with_year=save_with_year)
+            try:
+                status, paper_info = organize_info_by_txt(save_dir, url_txt_path, paper_name_with_year=save_with_year)
+            except Exception as e:
+                show_fail_window("解析文件出错：\n{}".format(e))
+                return
             if not status:
                 show_fail_window("URL文件未找到...")
+                return
+            if not paper_info:
+                show_fail_window("没有从文件中解析到任何论文。\n\n"
+                                 "请确认文件是 IEEE 导出的 BibTeX(.bib) 或 Plain Text(.txt)，"
+                                 "且内容有效。")
                 return
             if self.all_downloaded(paper_info):
                 info = "{}篇论文已存在，无需下载!".format(len(paper_info))
@@ -296,18 +318,41 @@ class App:
             return
         if not hasattr(self, 'download_pb'):
             return
-        while utils.get_value("progress_bar_num") < self.download_pb["maximum"]-1:
-            if self.pb_window and self.download_pb:
-                self.download_pb["value"] = utils.get_value("progress_bar_num")
+        # 进度窗口可能已被主线程销毁, 必须逐次判断控件是否还存在,
+        # 否则会抛 TclError: invalid command name ".!toplevel.!progressbar"
+        try:
+            while self.pb_window.winfo_exists() and self.download_pb.winfo_exists():
+                num = utils.get_value("progress_bar_num")
+                if num is None:
+                    num = 0
+                if num >= self.download_pb["maximum"] - 1:
+                    break
+                self.download_pb["value"] = num
                 self.pb_window.update()
-        if hasattr(self, 'pb_window'):
-            self.pb_window.destroy()
+                time.sleep(0.1)  # 避免空转占满 CPU
+            if self.pb_window.winfo_exists():
+                self.pb_window.destroy()
+        except Exception:
+            # 窗口已销毁属正常情况, 直接退出刷新线程
+            pass
 
     def begin_download_1(self):
+        # 防止重复点击: 多个下载线程同时跑会让请求量翻倍, 极易被 IEEE 限流
+        if self.downloading:
+            show_fail_window("已有下载任务正在进行中，请等待它结束。")
+            return
+        self.downloading = True
         try:
-            _thread.start_new_thread(self.download_1_thread, ())
+            _thread.start_new_thread(self._download_1_guard, ())
         except:
+            self.downloading = False
             show_fail_window("Error: 无法启动线程")
+
+    def _download_1_guard(self):
+        try:
+            self.download_1_thread()
+        finally:
+            self.downloading = False
 
     def all_downloaded(self, paperlist):
         for key, value in paperlist.items():
@@ -355,10 +400,21 @@ class App:
                 show_fail_window("下载失败，请检查配置。")
 
     def begin_download_2(self):
+        if self.downloading:
+            show_fail_window("已有下载任务正在进行中，请等待它结束。")
+            return
+        self.downloading = True
         try:
-            _thread.start_new_thread(self.download_2_thread, ())
+            _thread.start_new_thread(self._download_2_guard, ())
         except:
+            self.downloading = False
             show_fail_window("Error: 无法启动线程")
+
+    def _download_2_guard(self):
+        try:
+            self.download_2_thread()
+        finally:
+            self.downloading = False
 
     def close(self, *arg):
         if show_confirm("确认退出吗 ?"):
